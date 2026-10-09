@@ -1,0 +1,14 @@
+# Local configuration and credentials
+.env
+credentials/
+
+# Local virtual environment and Python-generated files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime sync checkpoint
+sync_state.json
+
+# Exported order data
+*.csv
