@@ -61,6 +61,7 @@ jspm_packages/
 .env*
 !.env.example
 .wrangler/
+worker-configuration.d.ts
 
 # python-specific
 python_modules/

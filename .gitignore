@@ -12,3 +12,7 @@ sync_state.json
 
 # Exported order data
 *.csv
+
+# Local verification artifacts
+.tmp/
+.wrangler/

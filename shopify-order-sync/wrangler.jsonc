@@ -5,6 +5,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "shopify-order-sync",
+	"keep_vars": true,
 	"main": "src/entry.py",
 	"compatibility_date": "2026-10-06",
 	"compatibility_flags": [
@@ -14,7 +15,7 @@
 		"enabled": true
 	},
 	"vars": {
-		SHOPIFY_STORE=4b0f4b-2.myshopify.com
+		"SHOPIFY_STORE":"4b0f4b-2.myshopify.com"
 	},
 	"triggers": {
 		"crons": ["30 21 * * *"]
