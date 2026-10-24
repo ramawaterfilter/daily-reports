@@ -1,8 +1,8 @@
 # Shopify order report on Cloudflare
 
-The scheduled Worker fetches orders for the selected calendar day in the store's
-timezone, applies the same formatting as the local `main.py` script, and replaces
-the values in the spreadsheet's first tab. An empty report writes headers only.
+The scheduled Worker fetches orders from October 1, 2026 in the store's timezone
+through the time each report starts, applies the same formatting as the local `main.py` script, and replaces
+the values in the selected spreadsheet tab (the first tab when no name is configured). An empty report writes headers only.
 Sheet values are replaced atomically after all orders have been fetched.
 
 ## Worker settings
@@ -17,10 +17,13 @@ Configure these in Cloudflare under the Worker's Settings → Variables and Secr
 | `SHOPIFY_CLIENT_SECRET` | Secret | Dev Dashboard app's client secret; exchanged for an access token once per report run |
 | `SHOPIFY_ACCESS_TOKEN` | Secret, alternative | An actual Admin API token if not using client credentials; never put the client secret here |
 | `GOOGLE_SHEET_ID` | Text | Spreadsheet ID, not its URL |
+| `GOOGLE_SHEET_TAB_ID` | Text, recommended | Numeric `gid` from the tab URL, including `0`; remains valid after renaming |
+| `GOOGLE_SHEET_TAB` | Text, optional | Legacy selection by exact tab name; used only when no tab ID is set |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Secret | Full Google service account JSON, including `client_email` and `private_key` |
 | `SHOPIFY_STORE_TIMEZONE` | Text, optional | Defaults to `Europe/London`; use the store's timezone |
 | `EXCLUDED_LINEITEM_SKUS` | Text, optional | Comma-separated SKUs to exclude |
-| `REPORT_DATE` | Text, optional | `YYYY-MM-DD` override; leave unset for the current date in the store's timezone |
+| `REPORT_START_DATE` | Text | `2026-10-01`, configured in `wrangler.jsonc`; cumulative report starting at midnight in the store's timezone |
+| `REPORT_DATE` | Text, optional | Single-day override only when `REPORT_START_DATE` is absent; remove it for cumulative reports |
 | `SYNC_TRIGGER_TOKEN` | Secret, optional | A long random token for manually running `POST /sync` |
 
 Enable Google Sheets API for the service account's project and share the target
@@ -45,8 +48,23 @@ npm run deploy
 ```
 
 The existing cron `30 21 * * *` runs daily at 21:30 UTC, or 03:00 IST the next day.
-The report uses the current calendar date in `SHOPIFY_STORE_TIMEZONE`, matching
-the local script; it does not automatically select yesterday.
+Each run rebuilds the full report from `REPORT_START_DATE` through the run time,
+including any orders already placed that day. Rows are replaced, so reruns do not
+append duplicates and existing orders' current statuses are refreshed. The store
+timezone controls the October 1 boundary and date formatting, while cron stays
+fixed to 03:00 IST regardless of daylight saving changes in London.
+
+The variable `START_DAT` is not used; set `REPORT_START_DATE` instead. Remove a
+previously configured `REPORT_DATE` to avoid freezing the report to one day.
+
+### Check a scheduled execution
+
+After deployment, verify Settings → Trigger Events lists `30 21 * * *` and select
+View events to inspect the scheduled invocation and its outcome. The cron may
+have fired even when a report failed. Logs start with `cron_triggered` (including
+the scheduled timestamp), followed by the normal sync stages. Trigger changes can
+take up to 15 minutes to propagate. Live `wrangler tail` only shows new events
+while connected, so use the dashboard for overnight execution history.
 
 ## Verify immediately
 
@@ -67,10 +85,20 @@ Invoke-RestMethod -Method Post -Uri 'https://YOUR-WORKER.workers.dev/sync' -Head
 }
 ```
 
-This writes the report to the first spreadsheet tab, replacing its current values.
+This writes the report to the selected spreadsheet tab, replacing its current values.
 Success returns `stage: sync_completed`, `report_date`, `orders`, and `rows`.
 Opening `/` in a browser only checks the status page and does not change the sheet.
 Unauthenticated requests to `/sync` cannot run a report.
+
+To target a particular tab, open it in Google Sheets and copy the number after
+`gid=` in its URL. For `https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit#gid=123456789`,
+set the Text runtime variable `GOOGLE_SHEET_TAB_ID` to `123456789` in Cloudflare
+and deploy this code. Keep `GOOGLE_SHEET_ID` as the ID of the whole spreadsheet.
+Renaming or reordering the tab does not change this connection. A tab ID takes
+precedence over `GOOGLE_SHEET_TAB`; when neither is set, the first tab is used.
+If the selected tab is deleted or its ID is wrong, the report fails before writing
+and never falls back to another tab. The access-check log shows the selected tab
+name and numeric tab ID. Recreating a deleted tab requires updating the ID.
 
 Logs record configuration checks, Google authentication and sheet access, Shopify
 page counts, prepared row counts, and completion. A failure includes `failed_stage`

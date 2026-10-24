@@ -15,7 +15,8 @@
 		"enabled": true
 	},
 	"vars": {
-		"SHOPIFY_STORE":"4b0f4b-2.myshopify.com"
+		"SHOPIFY_STORE":"4b0f4b-2.myshopify.com",
+		"REPORT_START_DATE": "2026-10-01"
 	},
 	"triggers": {
 		"crons": ["30 21 * * *"]

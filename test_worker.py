@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).parent / "shopify-order-sync" / "src"))
 sync = importlib.import_module("sync")
@@ -30,6 +31,31 @@ PROPERTIES = {"sheetId": 12, "index": 0, "gridProperties": {"rowCount": 1000, "c
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    def test_cumulative_report_starts_october_first_and_ends_at_run_time(self):
+        run_time = datetime(2026, 10, 23, 21, 30, tzinfo=timezone.utc)
+        with patch.object(sync, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = run_time
+            config = sync.configuration(environment(REPORT_DATE="", REPORT_START_DATE="2026-10-01"))
+        self.assertEqual(config["query"], "created_at:>='2026-09-30T23:00:00Z' created_at:<'2026-10-23T21:30:00Z'")
+        self.assertEqual(config["report_start_date"], "2026-10-01")
+        self.assertEqual(config["report_end_at"], "2026-10-23T21:30:00Z")
+
+    def test_cumulative_report_handles_london_daylight_saving_change(self):
+        run_time = datetime(2026, 10, 25, 21, 30, tzinfo=timezone.utc)
+        with patch.object(sync, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = run_time
+            config = sync.configuration(environment(REPORT_DATE="", REPORT_START_DATE="2026-10-01"))
+        self.assertEqual(config["query"], "created_at:>='2026-09-30T23:00:00Z' created_at:<'2026-10-25T21:30:00Z'")
+
+    def test_cumulative_report_rejects_future_start_and_frozen_report_date(self):
+        for overrides in (
+            {"REPORT_DATE": "", "REPORT_START_DATE": "2099-10-01"},
+            {"REPORT_DATE": "2026-10-23", "REPORT_START_DATE": "2026-10-01"},
+            {"REPORT_DATE": "", "REPORT_START_DATE": "October 1"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                sync.configuration(environment(**overrides))
+
     async def test_client_credentials_exchange_takes_precedence_over_old_token(self):
         config = sync.configuration(environment(SHOPIFY_CLIENT_ID="client-id", SHOPIFY_CLIENT_SECRET="client-secret"))
         with patch.object(sync, "request_json", new=AsyncMock(return_value={"access_token": "fresh-token"})) as request:
@@ -125,6 +151,59 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret-google-token", output.getvalue())
         self.assertNotIn("private-google-key", output.getvalue())
 
+    async def test_named_tab_is_selected_instead_of_first_tab(self):
+        target = PROPERTIES | {"sheetId": 99, "index": 1, "title": "October's Orders"}
+        request = AsyncMock(side_effect=[{"sheets": [
+            {"properties": PROPERTIES | {"title": "Summary"}}, {"properties": target},
+        ]}, {}])
+        with patch.object(sync, "google_access_token", new=AsyncMock(return_value="token")), \
+             patch.object(sync, "fetch_orders", new=AsyncMock(return_value=[])), \
+             patch.object(sync, "request_json", new=request), redirect_stdout(io.StringIO()):
+            await sync.run_sync(environment(GOOGLE_SHEET_TAB="October's Orders"))
+        body = json.loads(request.call_args.kwargs["body"])
+        self.assertEqual(body["requests"][-1]["updateCells"]["range"], {"sheetId": 99})
+
+    async def test_missing_named_tab_fails_without_fetching_orders_or_writing(self):
+        request = AsyncMock(return_value={"sheets": [{"properties": PROPERTIES | {"title": "Summary"}}]})
+        output = io.StringIO()
+        with patch.object(sync, "google_access_token", new=AsyncMock(return_value="token")), \
+             patch.object(sync, "fetch_orders", new=AsyncMock()) as fetch_orders, \
+             patch.object(sync, "request_json", new=request), redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, "google_sheet_access"):
+                await sync.run_sync(environment(GOOGLE_SHEET_TAB="Orders"))
+        request.assert_awaited_once()
+        fetch_orders.assert_not_awaited()
+        self.assertIn("does not match an existing tab", output.getvalue())
+
+    def test_tab_id_must_be_numeric(self):
+        for value in ("-1", "1.5", "gid=123", "https://docs.google.com/spreadsheets/d/id/edit#gid=123"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "numeric gid"):
+                sync.configuration(environment(GOOGLE_SHEET_TAB_ID=value))
+
+    async def test_tab_id_survives_rename_and_takes_precedence_over_name(self):
+        for tab_id in (0, 99):
+            with self.subTest(tab_id=tab_id):
+                target = PROPERTIES | {"sheetId": tab_id, "index": 1, "title": "Accidentally renamed"}
+                request = AsyncMock(side_effect=[{"sheets": [
+                    {"properties": PROPERTIES | {"title": "Old tab name"}}, {"properties": target},
+                ]}, {}])
+                with patch.object(sync, "google_access_token", new=AsyncMock(return_value="token")), \
+                     patch.object(sync, "fetch_orders", new=AsyncMock(return_value=[])), \
+                     patch.object(sync, "request_json", new=request), redirect_stdout(io.StringIO()):
+                    await sync.run_sync(environment(GOOGLE_SHEET_TAB_ID=str(tab_id), GOOGLE_SHEET_TAB="Old tab name"))
+                body = json.loads(request.call_args.kwargs["body"])
+                self.assertEqual(body["requests"][-1]["updateCells"]["range"], {"sheetId": tab_id})
+
+    async def test_missing_tab_id_never_falls_back_to_name_or_first_tab(self):
+        request = AsyncMock(return_value={"sheets": [{"properties": PROPERTIES | {"title": "Orders"}}]})
+        with patch.object(sync, "google_access_token", new=AsyncMock(return_value="token")), \
+             patch.object(sync, "fetch_orders", new=AsyncMock()) as fetch_orders, \
+             patch.object(sync, "request_json", new=request), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "google_sheet_access"):
+                await sync.run_sync(environment(GOOGLE_SHEET_TAB_ID="999", GOOGLE_SHEET_TAB="Orders"))
+        request.assert_awaited_once()
+        fetch_orders.assert_not_awaited()
+
     async def test_shopify_failure_preserves_sheet_and_identifies_stage(self):
         output = io.StringIO()
         request = AsyncMock(return_value={"sheets": [{"properties": PROPERTIES}]})
@@ -147,7 +226,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             response = await worker.fetch(request)
             self.assertEqual(response.status, 401)
             run.assert_not_awaited()
-            await worker.scheduled(None, None, None)
+            await worker.scheduled(SimpleNamespace(cron="30 21 * * *", scheduledTime=1792791000000), None, None)
             run.assert_awaited_once_with(worker.env)
 
 

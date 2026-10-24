@@ -31,6 +31,9 @@ def configuration(env):
     sheet_id = setting(env, "GOOGLE_SHEET_ID").strip()
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", sheet_id):
         raise ValueError("GOOGLE_SHEET_ID must be the spreadsheet ID, not its URL")
+    tab_id = setting(env, "GOOGLE_SHEET_TAB_ID").strip()
+    if tab_id and not re.fullmatch(r"[0-9]+", tab_id):
+        raise ValueError("GOOGLE_SHEET_TAB_ID must be the numeric gid from the tab URL")
     try:
         credentials = json.loads(setting(env, "GOOGLE_SERVICE_ACCOUNT_JSON"))
     except (ValueError, TypeError):
@@ -42,11 +45,23 @@ def configuration(env):
         raise ValueError("Google service account JSON needs client_email and private_key")
     store_timezone = setting(env, "SHOPIFY_STORE_TIMEZONE", "Europe/London")
     store_tz = ZoneInfo(store_timezone)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     report_date = date.fromisoformat(
-        setting(env, "REPORT_DATE") or datetime.now(store_tz).date().isoformat()
+        setting(env, "REPORT_DATE") or now.astimezone(store_tz).date().isoformat()
     )
-    start = datetime.combine(report_date, time.min, store_tz)
-    end = datetime.combine(report_date + timedelta(days=1), time.min, store_tz)
+    start_date_setting = setting(env, "REPORT_START_DATE")
+    if start_date_setting:
+        if setting(env, "REPORT_DATE"):
+            raise ValueError("Remove REPORT_DATE when using REPORT_START_DATE for daily cumulative reports")
+        start_date = date.fromisoformat(start_date_setting)
+        start = datetime.combine(start_date, time.min, store_tz)
+        end = now
+        if start >= end:
+            raise ValueError("REPORT_START_DATE must be earlier than the report run time")
+    else:
+        start_date = report_date
+        start = datetime.combine(report_date, time.min, store_tz)
+        end = datetime.combine(report_date + timedelta(days=1), time.min, store_tz)
     query = (
         f"created_at:>='{start.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}' "
         f"created_at:<'{end.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}'"
@@ -57,9 +72,13 @@ def configuration(env):
         "client_id": client_id,
         "client_secret": client_secret,
         "sheet_id": sheet_id,
+        "sheet_tab": setting(env, "GOOGLE_SHEET_TAB"),
+        "sheet_tab_id": int(tab_id) if tab_id else None,
         "credentials": credentials,
         "timezone": store_timezone,
         "report_date": report_date.isoformat(),
+        "report_start_date": start_date.isoformat(),
+        "report_end_at": end.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         "query": query,
         "excluded_skus": {
             sku.strip().casefold()
@@ -213,7 +232,7 @@ async def run_sync(env):
     print(json.dumps({"stage": "sync_started"}))
     try:
         config = configuration(env)
-        print(json.dumps({"stage": "configuration_checked", "report_date": config["report_date"], "timezone": config["timezone"]}))
+        print(json.dumps({"stage": "configuration_checked", "report_date": config["report_date"], "report_start_date": config["report_start_date"], "report_end_at": config["report_end_at"], "timezone": config["timezone"]}))
         stage = "google_authentication"
         token = await google_access_token(config["credentials"])
         print(json.dumps({"stage": "google_authenticated"}))
@@ -221,10 +240,20 @@ async def run_sync(env):
         sheet_url = f"https://sheets.googleapis.com/v4/spreadsheets/{config['sheet_id']}"
         stage = "google_sheet_access"
         metadata = await request_json(sheet_url + "?fields=sheets(properties)", headers=headers)
-        properties = min(metadata["sheets"], key=lambda sheet: sheet["properties"]["index"])["properties"]
+        tabs = [sheet["properties"] for sheet in metadata["sheets"]]
+        if config["sheet_tab_id"] is not None:
+            properties = next((tab for tab in tabs if tab["sheetId"] == config["sheet_tab_id"]), None)
+            if properties is None:
+                raise ValueError("GOOGLE_SHEET_TAB_ID does not match a tab in this spreadsheet; check its URL gid")
+        elif config["sheet_tab"]:
+            properties = next((tab for tab in tabs if tab.get("title") == config["sheet_tab"]), None)
+            if properties is None:
+                raise ValueError("GOOGLE_SHEET_TAB does not match an existing tab name; check spelling and case")
+        else:
+            properties = min(tabs, key=lambda tab: tab["index"])
         if properties.get("sheetType", "GRID") != "GRID":
-            raise ValueError("The first spreadsheet tab must be a regular grid sheet")
-        print(json.dumps({"stage": "google_sheet_access_checked"}))
+            raise ValueError("The selected spreadsheet tab must be a regular grid sheet")
+        print(json.dumps({"stage": "google_sheet_access_checked", "sheet_tab": properties.get("title"), "sheet_tab_id": properties["sheetId"]}))
         stage = "shopify_authentication"
         config["shopify_token"] = await shopify_access_token(config)
         print(json.dumps({"stage": "shopify_authenticated"}))
@@ -236,7 +265,7 @@ async def run_sync(env):
         stage = "google_sheet_write"
         await request_json(sheet_url + ":batchUpdate", method="POST", headers=headers,
                            body=json.dumps(sheet_update(properties, rows)))
-        result = {"stage": "sync_completed", "report_date": config["report_date"], "orders": len(orders), "rows": len(rows)}
+        result = {"stage": "sync_completed", "report_date": config["report_date"], "report_start_date": config["report_start_date"], "report_end_at": config["report_end_at"], "orders": len(orders), "rows": len(rows)}
         print(json.dumps(result))
         return result
     except Exception as exc:

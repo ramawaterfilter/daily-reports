@@ -1,4 +1,5 @@
 import hmac
+import json
 from urllib.parse import urlsplit
 
 from workers import Response, WorkerEntrypoint
@@ -22,6 +23,7 @@ class Default(WorkerEntrypoint):
         return Response("Shopify Order Sync Worker is running!")
 
     async def scheduled(self, controller, env, ctx):
+        print(json.dumps({"stage": "cron_triggered", "cron": controller.cron, "scheduled_time_ms": controller.scheduledTime}))
         await run_sync(self.env)
 
 
